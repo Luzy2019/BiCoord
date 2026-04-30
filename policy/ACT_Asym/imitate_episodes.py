@@ -99,12 +99,16 @@ def main(args):
             "asym_stride_choices": args.get("asym_stride_choices", ""),
             "asym_hard_inference": args.get("asym_hard_inference", True),
             "asym_update_threshold": args.get("asym_update_threshold", 0.5),
+            "asym_num_roles": args.get("asym_num_roles", 4),
+            "asym_role_emb_dim": args.get("asym_role_emb_dim", 16),
+            "asym_use_role_condition": args.get("asym_use_role_condition", True),
             "asym_lambda_res": args.get("asym_lambda_res", 1e-4),
             "asym_lambda_gate": args.get("asym_lambda_gate", 1e-4),
             "asym_lambda_smooth": args.get("asym_lambda_smooth", 1e-3),
             "asym_lambda_freq": args.get("asym_lambda_freq", 1e-2),
             "asym_lambda_update_kl": args.get("asym_lambda_update_kl", 1e-2),
             "asym_lambda_update_sparse": args.get("asym_lambda_update_sparse", 1e-3),
+            "asym_lambda_role": args.get("asym_lambda_role", 1e-2),
         }
     elif policy_class == "CNNMLP":
         policy_config = {
@@ -535,11 +539,16 @@ if __name__ == "__main__":
     parser.add_argument("--asym_hard_inference", action="store_true", default=True)
     parser.add_argument("--asym_soft_inference", action="store_false", dest="asym_hard_inference")
     parser.add_argument("--asym_update_threshold", action="store", type=float, default=0.5)
+    parser.add_argument("--asym_num_roles", action="store", type=int, default=4)
+    parser.add_argument("--asym_role_emb_dim", action="store", type=int, default=16)
+    parser.add_argument("--asym_use_role_condition", action="store_true", default=True)
+    parser.add_argument("--asym_no_role_condition", action="store_false", dest="asym_use_role_condition")
     parser.add_argument("--asym_lambda_res", action="store", type=float, default=1e-4)
     parser.add_argument("--asym_lambda_gate", action="store", type=float, default=1e-4)
     parser.add_argument("--asym_lambda_smooth", action="store", type=float, default=1e-3)
     parser.add_argument("--asym_lambda_freq", action="store", type=float, default=1e-2)
     parser.add_argument("--asym_lambda_update_kl", action="store", type=float, default=1e-2)
     parser.add_argument("--asym_lambda_update_sparse", action="store", type=float, default=1e-3)
+    parser.add_argument("--asym_lambda_role", action="store", type=float, default=1e-2)
 
     main(vars(parser.parse_args()))

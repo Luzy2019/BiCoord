@@ -29,17 +29,21 @@ asym_residual_scale: 0.1
 asym_projector_mode: hold
 asym_strict_execution: true
 asym_use_qpos_condition: true
-asym_schedule_mode: fixed
-asym_target_mode: projected
+asym_schedule_mode: learned
+asym_target_mode: original
 asym_stride_choices: ""
 asym_hard_inference: true
 asym_update_threshold: 0.5
+asym_num_roles: 4
+asym_role_emb_dim: 16
+asym_use_role_condition: true
 asym_lambda_res: 0.0001
 asym_lambda_gate: 0.0001
 asym_lambda_smooth: 0.001
 asym_lambda_freq: 0.01
 asym_lambda_update_kl: 0.01
 asym_lambda_update_sparse: 0.001
+asym_lambda_role: 0.01
 
 # DETR parser args
 ckpt_dir: null

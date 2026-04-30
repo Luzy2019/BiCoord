@@ -16,6 +16,7 @@ try:
         LearnedAsymFreqResidualAdapter,
         bernoulli_kl,
         motion_energy_update_target,
+        motion_role_target,
     )
 except:
     from .detr.main import (
@@ -27,6 +28,7 @@ except:
         LearnedAsymFreqResidualAdapter,
         bernoulli_kl,
         motion_energy_update_target,
+        motion_role_target,
     )
 import IPython
 
@@ -50,6 +52,7 @@ class ACTPolicy(nn.Module):
             "freq": float(args_override.get("asym_lambda_freq", 1e-2)),
             "update_kl": float(args_override.get("asym_lambda_update_kl", 1e-2)),
             "update_sparse": float(args_override.get("asym_lambda_update_sparse", 1e-3)),
+            "role": float(args_override.get("asym_lambda_role", 1e-2)),
         }
         self.asym_use_qpos_condition = bool(args_override.get("asym_use_qpos_condition", True))
         self.asym_schedule_mode = args_override.get("asym_schedule_mode", "fixed")
@@ -97,6 +100,9 @@ class ACTPolicy(nn.Module):
                     residual_scale=float(args_override.get("asym_residual_scale", 0.1)),
                     hard_inference=bool(args_override.get("asym_hard_inference", True)),
                     update_threshold=float(args_override.get("asym_update_threshold", 0.5)),
+                    num_roles=int(args_override.get("asym_num_roles", 4)),
+                    role_emb_dim=int(args_override.get("asym_role_emb_dim", 16)),
+                    use_role_condition=bool(args_override.get("asym_use_role_condition", True)),
                 )
             else:
                 raise ValueError(f"Unsupported asym_schedule_mode: {self.asym_schedule_mode}")
@@ -132,7 +138,7 @@ class ACTPolicy(nn.Module):
             return None
         return qpos
 
-    def _apply_asym_adapter(self, actions, qpos, left_stride=None, right_stride=None):
+    def _apply_asym_adapter(self, actions, qpos, left_stride=None, right_stride=None, role_id=None):
         if not self.use_asym_residual:
             return actions, None
         if self.asym_schedule_mode == "fixed":
@@ -142,7 +148,7 @@ class ACTPolicy(nn.Module):
                 left_stride=left_stride,
                 right_stride=right_stride,
             )
-        return self.asym_adapter(actions, cond=self._asym_cond(qpos))
+        return self.asym_adapter(actions, cond=self._asym_cond(qpos), role_id=role_id)
 
     def _build_training_target(self, actions, left_stride=None, right_stride=None):
         if (
@@ -231,10 +237,16 @@ class ACTPolicy(nn.Module):
             losses["asym_update_sparse"] = (update_prob[:, 1:] * update_valid[:, 1:]).sum() / (
                 update_valid[:, 1:].sum().clamp(min=1.0) * update_prob.shape[-1]
             )
+            role_target = motion_role_target(
+                target_actions,
+                slice(left_start, left_stop),
+                slice(right_start, right_stop),
+            )
+            losses["asym_role"] = F.cross_entropy(adapter_info["role_logits"], role_target)
 
         return losses
 
-    def __call__(self, qpos, image, actions=None, is_pad=None, return_info=False):
+    def __call__(self, qpos, image, actions=None, is_pad=None, return_info=False, role_id=None):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         image = normalize(image)
@@ -245,7 +257,7 @@ class ACTPolicy(nn.Module):
             target_actions = self._build_training_target(actions, left_stride, right_stride)
 
             a_hat, is_pad_hat, (mu, logvar) = self.model(qpos, image, env_state, target_actions, is_pad)
-            a_hat, adapter_info = self._apply_asym_adapter(a_hat, qpos, left_stride, right_stride)
+            a_hat, adapter_info = self._apply_asym_adapter(a_hat, qpos, left_stride, right_stride, role_id=role_id)
             total_kld, dim_wise_kld, mean_kld = kl_divergence(mu, logvar)
             loss_dict = dict()
             all_l1 = F.l1_loss(target_actions, a_hat, reduction="none")
@@ -264,7 +276,7 @@ class ACTPolicy(nn.Module):
         else:  # inference time
             a_hat, _, (_, _) = self.model(qpos, image, env_state)  # no action, sample from prior
             left_stride, right_stride = self._sample_strides(is_training=False)
-            a_hat, adapter_info = self._apply_asym_adapter(a_hat, qpos, left_stride, right_stride)
+            a_hat, adapter_info = self._apply_asym_adapter(a_hat, qpos, left_stride, right_stride, role_id=role_id)
             if return_info:
                 return a_hat, adapter_info
             return a_hat
@@ -318,6 +330,19 @@ def kl_divergence(mu, logvar):
 
 
 class ACT:
+    ROLE_NAME_TO_ID = {
+        "balanced": 0,
+        "equal": 0,
+        "left_primary": 1,
+        "left_high": 1,
+        "left_operate": 1,
+        "right_primary": 2,
+        "right_high": 2,
+        "right_operate": 2,
+        "static": 3,
+        "hold": 3,
+    }
+
 
     def __init__(self, args_override=None, RoboTwin_Config=None):
         if args_override is None:
@@ -350,6 +375,7 @@ class ACT:
 
         self.t = 0  # Current timestep
         self.last_asym_info = None
+        self.last_action_packet = None
 
         # Load statistics for normalization
         ckpt_dir = args_override.get("ckpt_dir", "")
@@ -391,7 +417,62 @@ class ACT:
             return action * self.stats["action_std"] + self.stats["action_mean"]
         return action
 
-    def get_action(self, obs=None):
+    def _obs_role_id(self, obs):
+        role = obs.get("asym_role_id", obs.get("asym_role", None))
+        if role is None and "instruction" in obs:
+            instruction = str(obs["instruction"]).lower()
+            if "left" in instruction and ("operate" in instruction or "move" in instruction or "primary" in instruction):
+                role = "left_primary"
+            elif "right" in instruction and ("operate" in instruction or "move" in instruction or "primary" in instruction):
+                role = "right_primary"
+            elif "hold" in instruction or "fix" in instruction or "stable" in instruction:
+                if "left" in instruction and "right" not in instruction:
+                    role = "right_primary"
+                elif "right" in instruction and "left" not in instruction:
+                    role = "left_primary"
+                else:
+                    role = "static"
+            elif "both" in instruction or "together" in instruction or "dual" in instruction:
+                role = "balanced"
+        if role is None:
+            return None
+        if isinstance(role, str):
+            role = self.ROLE_NAME_TO_ID.get(role, 0)
+        return torch.tensor([int(role)], device=self.device)
+
+    def _current_update_value(self, info, name, chunk_step):
+        if info is None:
+            return True
+        frequency = info.get("frequency", {})
+        gate = frequency.get(f"{name}_update_gate", frequency.get(f"{name}_update_mask"))
+        if gate is None:
+            return True
+        value = gate[0, chunk_step, 0].detach().cpu().item()
+        return bool(value >= 0.5)
+
+    def _build_action_packet(self, action, chunk_step):
+        action_1d = np.asarray(action).reshape(-1)
+        left_slice = (0, self.state_dim // 2)
+        right_slice = (self.state_dim // 2, self.state_dim)
+        if self.last_asym_info is not None:
+            frequency = self.last_asym_info.get("frequency", {})
+            left_slice = frequency.get("left_slice", left_slice)
+            right_slice = frequency.get("right_slice", right_slice)
+
+        packet = {
+            "action": action_1d,
+            "left_action": action_1d[left_slice[0]:left_slice[1]],
+            "right_action": action_1d[right_slice[0]:right_slice[1]],
+            "left_update": self._current_update_value(self.last_asym_info, "left", chunk_step),
+            "right_update": self._current_update_value(self.last_asym_info, "right", chunk_step),
+            "left_slice": left_slice,
+            "right_slice": right_slice,
+        }
+        if self.last_asym_info is not None and "role_prob" in self.last_asym_info:
+            packet["role_prob"] = self.last_asym_info["role_prob"][0].detach().cpu().numpy()
+        return packet
+
+    def get_action(self, obs=None, return_packet=False):
         if obs is None:
             return None
 
@@ -408,12 +489,18 @@ class ACT:
             curr_images.append(obs[cam_name])
         curr_image = np.stack(curr_images, axis=0)
         curr_image = torch.from_numpy(curr_image).float().to(self.device).unsqueeze(0)
+        role_id = self._obs_role_id(obs)
 
         with torch.no_grad():
             # Only query the policy at specified intervals - exactly like imitate_episodes.py
             if self.t % self.query_frequency == 0:
                 if self.policy.use_asym_residual:
-                    self.all_actions, self.last_asym_info = self.policy(qpos, curr_image, return_info=True)
+                    self.all_actions, self.last_asym_info = self.policy(
+                        qpos,
+                        curr_image,
+                        return_info=True,
+                        role_id=role_id,
+                    )
                 else:
                     self.all_actions = self.policy(qpos, curr_image)
                     self.last_asym_info = None
@@ -434,11 +521,18 @@ class ACT:
                 raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
             else:
                 # Direct action selection, same as imitate_episodes.py
-                raw_action = self.all_actions[:, self.t % self.query_frequency]
+                chunk_step = self.t % self.query_frequency
+                raw_action = self.all_actions[:, chunk_step]
 
         # Denormalize action
         raw_action = raw_action.cpu().numpy()
         action = self.post_process(raw_action)
+        if self.temporal_agg:
+            chunk_step = min(self.t, self.num_queries - 1)
+        packet = self._build_action_packet(action, chunk_step)
+        self.last_action_packet = packet
 
         self.t += 1
+        if return_packet:
+            return packet
         return action
